@@ -1,63 +1,72 @@
 # Shikshalokam Mohini Service – Local Setup
+
 ---
 
 ## Prerequisites
 
-* macOS
-* Homebrew installed
-* Python 3.10
-* Git
+| | macOS | Linux (Ubuntu 20.04+) |
+|---|---|---|
+| Package manager | Homebrew | apt |
+| Python | 3.10 | 3.10 |
+| Other | — | `sudo` access |
+| Common | Git | Git |
 
 ---
 
 ## 1. Install Python 3.10 and uv Dependency Manager
 
+**macOS:**
 ```bash
 brew install python@3.10
 ```
 
-Verify installation:
+**Linux:**
+```bash
+sudo apt update
+sudo apt install -y python3.10 python3.10-venv python3.10-dev python3-pip
+```
 
+Verify installation (both):
 ```bash
 python3.10 --version
 ```
 
-Install uv:
-```base
+Install uv (both):
+```bash
 pip install uv
 ```
 
+> ⚠️ On Linux, if `pip` doesn't point to Python 3.10, use `python3.10 -m pip install uv` instead.
+
 ---
 
-## 2. Create a Virtual Environment (Outside Project Directory)
-
-Assuming your project is located at:
-
-```
-/Users/kunal/PycharmProjects/shikshalokam-mohini-service
-```
+## 2. Create a Virtual Environment
 
 ### Step 1: Go to the project directory
 
+**macOS:**
 ```bash
 cd /Users/kunal/PycharmProjects/shikshalokam-mohini-service
 ```
 
-### Step 2: Create the virtual environment
+**Linux:**
+```bash
+cd /home/<your-user>/projects/shikshalokam-mohini-service
+```
 
+### Step 2: Create the virtual environment (both)
 ```bash
 uv venv
 ```
 
-### Step 3: Activate the virtual environment
-
+### Step 3: Activate the virtual environment (both)
 ```bash
 source .venv/bin/activate
 ```
 
 ---
 
-## 3. Install Project Dependencies
+## 3. Install Project Dependencies (both)
 
 ```bash
 uv sync
@@ -65,7 +74,7 @@ uv sync
 
 ---
 
-## 4. Load Environment Variables
+## 4. Load Environment Variables (both)
 
 Make sure you have a `.env` file in the project root.
 
@@ -77,67 +86,103 @@ export $(cat .env | xargs)
 
 ---
 
-## 5. Set Up Local PostgreSQL Database
+## 5. Create `secrets.json`
 
-### 5.1 Install PostgreSQL
+The app reads secrets from `config/secrets.json`. Create the config directory and file:
 
-Using Homebrew:
+```bash
+mkdir -p config
+nano config/secrets.json
+```
 
+Paste the content shared by your team. The file follows this structure:
+
+```json
+{
+  "SECRET_KEY": "your-django-secret-key",
+  "DATABASE_NAME": "mitra_db",
+  "DATABASE_USER": "mitra_user",
+  "DATABASE_PASSWORD": "mitra_password",
+  "DATABASE_HOST": "localhost",
+  "DATABASE_PORT": "5432"
+}
+```
+
+> ℹ️ To see all keys the app expects, run:
+> ```bash
+> grep -n "SECRETS\[" shikshalokam_mohini/settings.py
+> ```
+
+---
+
+## 6. Set Up Local PostgreSQL Database
+
+### 6.1 Install PostgreSQL
+
+**macOS:**
 ```bash
 brew install postgresql@14
 ```
 
-Start PostgreSQL:
+**Linux:**
+```bash
+sudo apt install -y postgresql postgresql-contrib
+```
 
+### 6.2 Start PostgreSQL
+
+**macOS:**
 ```bash
 brew services start postgresql@14
 ```
 
-Verify it’s running:
+**Linux:**
+```bash
+sudo systemctl start postgresql
+sudo systemctl enable postgresql
+```
 
+### 6.3 Verify it's running
+
+**macOS:**
 ```bash
 psql --version
 ```
 
+**Linux:**
+```bash
+psql --version
+sudo systemctl status postgresql
+```
+
 ---
 
-### 5.2 Create Database and User
+### 6.4 Create Database and User
 
-Login to Postgres:
-
+**macOS** — login to Postgres:
 ```bash
 psql postgres
 ```
 
-Create a database user:
+**Linux** — login to Postgres:
+```bash
+cd /tmp && sudo -u postgres psql
+```
+
+> ℹ️ On Linux, `cd /tmp` avoids a harmless "Permission denied" warning when switching to the postgres system user.
+
+Then run the following (both):
 
 ```sql
 CREATE USER mitra_user WITH PASSWORD 'mitra_password';
-```
-
-Create the database:
-
-```sql
 CREATE DATABASE mitra_db OWNER mitra_user;
-```
-
-Grant privileges:
-
-```sql
 GRANT ALL PRIVILEGES ON DATABASE mitra_db TO mitra_user;
-```
-
-Exit psql:
-
-```sql
 \q
 ```
 
 ---
 
-### 5.3 Update `.env` File
-
-Add or update the following variables in your `.env` file:
+### 6.5 Update `.env` File (both)
 
 ```env
 DATABASE_NAME=mitra_db
@@ -147,64 +192,91 @@ DATABASE_HOST=localhost
 DATABASE_PORT=5432
 ```
 
-### 5.4 Install PostgreSQL Python Driver
+---
 
-Make sure this dependency exists (usually already in `requirements.in`):
+### 6.6 Install PostgreSQL Python Driver (both)
 
 ```bash
 uv pip install psycopg2-binary
 ```
 
----
-
-### 5.5 Run Django Migrations
-
-Ensure your virtual environment is active and env vars are loaded:
-
+**Linux only** — if you get build errors, install system headers first:
 ```bash
-export $(cat .env | xargs)
+sudo apt install -y libpq-dev gcc
 ```
 
-Run migrations:
+Then retry the install.
 
+---
+
+### 6.7 Run Django Migrations (both)
+
+Ensure your virtual environment is active and env vars are loaded:
 ```bash
+export $(cat .env | xargs)
 python3 manage.py migrate
 ```
 
-(Optional) Create a superuser:
-
-You can accept the default name and give any password, keep email 
-empty and just press enter till completed.
-
+(Optional) Create a superuser — accept the default name, leave email empty, set any password:
 ```bash
 python3 manage.py createsuperuser
 ```
 
 ---
 
-## Common Issues
+### 6.8 Seed Initial Data (both)
+
+After migrations, run the following command to insert the required initial data into the database:
+
+```bash
+python3 manage.py prepare_db
+```
+
+---
+
+## Common PostgreSQL Issues
 
 **Postgres not starting**
 
-```bash
-brew services restart postgresql@14
-```
+macOS: `brew services restart postgresql@14`
+
+Linux: `sudo systemctl restart postgresql`
 
 **Role does not exist**
 
-```bash
-psql postgres
-\du
-```
+macOS: `psql postgres` then `\du`
+
+Linux: `sudo -u postgres psql` then `\du`
 
 **Port conflict**
 
+macOS: `lsof -i :5432`
+
+Linux: `sudo lsof -i :5432` or `ss -tulpn | grep 5432`
+
+**Peer authentication error (Linux only)**
+
+If you see `FATAL: Peer authentication failed for user "mitra_user"`, edit `pg_hba.conf`:
+
 ```bash
-lsof -i :5432
+sudo nano /etc/postgresql/14/main/pg_hba.conf
 ```
 
+Find the `local` line and change `peer` to `md5`:
 
-## 6. Run the Application Server
+```
+# Before
+local   all             all                                     peer
+
+# After
+local   all             all                                     md5
+```
+
+Then restart: `sudo systemctl restart postgresql`
+
+---
+
+## 7. Run the Application Server (both)
 
 ```bash
 uvicorn shikshalokam_mohini.asgi:application \
@@ -218,9 +290,9 @@ uvicorn shikshalokam_mohini.asgi:application \
 
 ---
 
-## 7. Run Celery Worker
+## 8. Run Celery Worker (both)
 
-Open a new terminal (with the same virtual environment activated):
+Open a new terminal with the virtual environment activated:
 
 ```bash
 celery -A shikshalokam_mohini worker --pool=threads
@@ -230,50 +302,46 @@ celery -A shikshalokam_mohini worker --pool=threads
 
 ## Notes
 
-* Ensure Redis or any other required backing services are running before starting Celery.
-* Always activate `mitra_env` before running server or worker commands.
+* Ensure Redis is running before starting Celery.
+* Always activate `.venv` before running server or worker commands.
 
 ---
 
-Perfect, let’s plug **Redis setup** into the README cleanly 👌
-You can add this as the next section.
+## 9. Set Up Redis (Local, if Celery gives errors)
 
----
+### 9.1 Install Redis
 
-## 8. Set Up Redis (Local, IF celery gives error)
-
-Redis is required for Celery and background task processing.
-
----
-
-### 8.1 Install Redis
-
-Using Homebrew:
-
+**macOS:**
 ```bash
 brew install redis
 ```
 
----
+**Linux:**
+```bash
+sudo apt install -y redis-server
+```
 
-### 8.2 Start Redis Server
+### 9.2 Start Redis
 
-Start Redis as a background service:
-
+**macOS:**
 ```bash
 brew services start redis
 ```
----
 
-### 8.3 Verify Redis Is Running
+**Linux:**
+```bash
+sudo systemctl start redis
+sudo systemctl enable redis
+```
+
+### 9.3 Verify Redis is running (both)
 
 ```bash
 redis-cli ping
 ```
 
 Expected output:
-
-```text
+```
 PONG
 ```
 
@@ -283,12 +351,36 @@ PONG
 
 **Redis not running**
 
+macOS: `brew services restart redis`
+
+Linux: `sudo systemctl restart redis`
+
+**Check Redis status (Linux)**
 ```bash
-brew services restart redis
+sudo systemctl status redis
 ```
 
 **Port already in use**
 
-```bash
-lsof -i :6379
-```
+macOS: `lsof -i :6379`
+
+Linux: `sudo lsof -i :6379` or `ss -tulpn | grep 6379`
+
+---
+
+## 10. Post-Setup: Configure Admin User Password
+
+Once the service is up and running, set the password for the default admin account via the Django admin panel.
+
+1. Open the admin panel in your browser:
+   ```
+   http://localhost:9000/admin
+   ```
+
+2. Navigate to: **Profiles** section
+
+3. Find the user: **null@shikshalokam.org**
+
+4. Set the password to: `grit@123`
+
+> ⚠️ This step is required before using the service — the default account won't be accessible otherwise.
