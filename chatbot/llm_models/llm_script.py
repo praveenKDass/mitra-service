@@ -17,9 +17,10 @@ import logging
 import os
 import requests
 import traceback
-
+from langfuse import observe, get_client
 
 logger = logging.getLogger('django')
+langfuse_context = get_client()
 validate = URLValidator()
 AWS_KEY = os.getenv('AWS_ACCESS_KEY_ID')
 AWS_SECRET_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
@@ -81,7 +82,8 @@ def handle_llama_model(
     else:
         return response_str
 
-
+# Add to OpenAI Handler
+@observe(as_type="generation")
 def handle_openai_model(
         messages, max_token=None, temperature=None, company_bot=None, model_name=None, is_json_response=True,
         stream=False, key_name='OPENAI_API_KEY', is_actual_key=False, tools=None, tool_choice=None, client_choice=None,
@@ -210,6 +212,8 @@ def retry_if_result_none(result):
     return result is None
 
 @retry(stop_max_attempt_number=llm_retry_number, retry_on_result=retry_if_result_none, wrap_exception=True)
+# Add to Bedrock Handler
+@observe(as_type="generation")
 def handle_bedrock_model(
         company_bot, system_prompt=None, messages=None, max_token=None, temperature=None, top_p=None,
         model_name=None, region_name='us-west-2', tools=None, is_json_response=False, aws_key=None,
@@ -225,9 +229,15 @@ def handle_bedrock_model(
         read_timeout = getattr(company_bot, 'read_timeout', 10.0)
         chat_history_limit = getattr(company_bot, 'chat_history_limit', 1000)
 
-    env_dict = load_env_to_dict(company_bot.provider_keys)
-    if env_dict.get("AWS_REGION"):
-        region_name = env_dict.get("AWS_REGION")
+    # env_dict = load_env_to_dict(company_bot.provider_keys)
+    # if env_dict.get("AWS_REGION"):
+    #     region_name = env_dict.get("AWS_REGION")
+    print("company_bot: ", company_bot.provider_keys)
+    env_dict = load_env_to_dict(company_bot.provider_keys if not isinstance(company_bot, dict) else company_bot.get('provider_keys'))
+
+    aws_access_key = aws_key or env_dict.get("AWS_ACCESS_KEY_ID") or AWS_KEY
+    aws_secret_key = aws_secret_key or env_dict.get("AWS_SECRET_ACCESS_KEY") or AWS_SECRET_KEY
+    region_name = env_dict.get("AWS_REGION") or region_name
 
     boto_config = BotoConfig(
         connect_timeout=connect_timeout,
@@ -238,10 +248,20 @@ def handle_bedrock_model(
     bedrock_runtime = boto3.client(
         service_name='bedrock-runtime',
         region_name=region_name,
-        aws_access_key_id=aws_key if aws_key else AWS_KEY,
-        aws_secret_access_key=aws_secret_key if aws_secret_key else AWS_SECRET_KEY,
+        aws_access_key_id=aws_access_key,
+        aws_secret_access_key=aws_secret_key,
         config=boto_config
     )
+
+
+
+    # bedrock_runtime = boto3.client(
+    #     service_name='bedrock-runtime',
+    #     region_name=region_name,
+    #     aws_access_key_id=aws_key if aws_key else AWS_KEY,
+    #     aws_secret_access_key=aws_secret_key if aws_secret_key else AWS_SECRET_KEY,
+    #     config=boto_config
+    # )
     print("aws_key used: ", aws_key if aws_key else AWS_KEY)
     if model_name:
         model_id = model_name
@@ -286,11 +306,19 @@ def handle_bedrock_model(
             messages = messages[start_idx:last_user_idx + 1]
 
     try:
+        system_formatted = None
+        if system_prompt:
+            if isinstance(system_prompt, str):
+                system_formatted = [{'text': system_prompt}]
+            elif isinstance(system_prompt, list):
+                system_formatted = system_prompt
+
         request_payload = {
             'modelId': model_id,
-            'messages': messages,
-            'system': system_prompt,
+            'messages': messages or [],
         }
+        if system_formatted:
+            request_payload['system'] = system_formatted
         if inference_config:
             request_payload['inferenceConfig'] = inference_config
         if tools:
@@ -349,7 +377,48 @@ def handle_bedrock_model(
                 final_output = content_tool
             if isinstance(final_output, dict) and not final_output.get('toolUseId'):
                 logger.error(f"Tool call missing toolUseId, retrying: {final_output}")
+
+                # --- LANGFUSE SCORE: retry-triggering failure mode ---
+                try:
+                    langfuse_context.score_current_observation(
+                        name="generation_outcome",
+                        value="missing_tool_use_id",
+                        data_type="CATEGORICAL"
+                    )
+                except Exception as se:
+                    logger.error(f"Langfuse score logging failed: {se}")
+                # -------------------------------------------------------
+
                 return None
+
+            try:
+                langfuse_context.update_current_generation(
+                    name="bedrock-converse",
+                    model=model_id,
+                    input=messages,
+                    output=final_output,
+                    usage_details={
+                        "input": usage_metrics.get('inputTokens', 0),
+                        "output": usage_metrics.get('outputTokens', 0),
+                        "total": usage_metrics.get('totalTokens', 0)
+                    },
+                    metadata={"stop_reason": response.get('stopReason'), "region": region_name}
+                )
+            except Exception as le:
+                logger.error(f"Langfuse generation logging failed: {le}")
+
+            # --- LANGFUSE SCORE: successful tool-call generation ---
+            try:
+                langfuse_context.score_current_observation(
+                    name="generation_outcome",
+                    value="tool_call_success",
+                    data_type="CATEGORICAL"
+                )
+            except Exception as se:
+                logger.error(f"Langfuse score logging failed: {se}")
+            # ---------------------------------------------------------
+
+            return final_output
         else:
             content_text = content.get('text')
             json_start = content_text.find('{')
@@ -362,29 +431,106 @@ def handle_bedrock_model(
                     final_output = json_repair.repair_json(json_str, return_objects=True)
                     logger.info('Loads final_output: %s', final_output)
                 except json.JSONDecodeError as e:
+
+                    # --- LANGFUSE SCORE: retry-triggering failure mode ---
+                    try:
+                        langfuse_context.score_current_observation(
+                            name="generation_outcome",
+                            value="json_decode_failed",
+                            data_type="CATEGORICAL",
+                            comment=str(e)[:200]
+                        )
+                    except Exception as se:
+                        logger.error(f"Langfuse score logging failed: {se}")
+                    # -------------------------------------------------------
+
                     return None
             elif is_json_response:
+
+                # --- LANGFUSE SCORE: retry-triggering failure mode ---
+                try:
+                    langfuse_context.score_current_observation(
+                        name="generation_outcome",
+                        value="no_json_found",
+                        data_type="CATEGORICAL"
+                    )
+                except Exception as se:
+                    logger.error(f"Langfuse score logging failed: {se}")
+                # -------------------------------------------------------
+
                 return None
             else:
-                return content_text
+                final_output = content_text
 
-        return final_output
+            try:
+                langfuse_context.update_current_generation(
+                    name="bedrock-converse",
+                    model=model_id,
+                    input=messages,
+                    output=final_output,
+                    usage_details={
+                        "input": usage_metrics.get('inputTokens', 0),
+                        "output": usage_metrics.get('outputTokens', 0),
+                        "total": usage_metrics.get('totalTokens', 0)
+                    },
+                    metadata={"stop_reason": response.get('stopReason'), "region": region_name}
+                )
+            except Exception as le:
+                logger.error(f"Langfuse generation logging failed: {le}")
+
+            # --- LANGFUSE SCORE: successful text/json generation ---
+            try:
+                langfuse_context.score_current_observation(
+                    name="generation_outcome",
+                    value="json_parse_success" if json_start != -1 else "text_response",
+                    data_type="CATEGORICAL"
+                )
+            except Exception as se:
+                logger.error(f"Langfuse score logging failed: {se}")
+            # ----------------------------------------------------------
+
+            return final_output
     except ClientError as e:
         error_response = e.response
-        logger.error("❌ Bedrock ClientError:")
+        logger.error("❌ Bedrock ClientError:", exc_info=True)
         logger.error(f"Error Code: {error_response['Error']['Code']}")
         logger.error(f"Error Message: {error_response['Error']['Message']}")
         logger.error(f"Request ID: {error_response.get('ResponseMetadata', {}).get('RequestId')}")
-        print("❌ ClientError:")
-        print("Error Code:", error_response["Error"]["Code"])
-        print("Error Message:", error_response["Error"]["Message"])
-        print("Request ID:", error_response.get("ResponseMetadata", {}).get("RequestId"))
+        print("❌ ClientError:", e)
+        traceback.print_exc()
+
+        # --- LANGFUSE SCORE: Bedrock client-side error ---
+        try:
+            langfuse_context.score_current_observation(
+                name="generation_outcome",
+                value="bedrock_client_error",
+                data_type="CATEGORICAL",
+                comment=f"{error_response['Error']['Code']}: {error_response['Error']['Message'][:150]}"
+            )
+        except Exception as se:
+            logger.error(f"Langfuse score logging failed: {se}")
+        # -----------------------------------------------------
+
+        return None
     except Exception as e:
         logger.error('Error processing request: %s', e, exc_info=True)
         print(f'❌ Error processing Bedrock request: {e}')
+        traceback.print_exc()
+
+        # --- LANGFUSE SCORE: unhandled exception ---
+        try:
+            langfuse_context.score_current_observation(
+                name="generation_outcome",
+                value="unhandled_exception",
+                data_type="CATEGORICAL",
+                comment=str(e)[:200]
+            )
+        except Exception as se:
+            logger.error(f"Langfuse score logging failed: {se}")
+        # -----------------------------------------------
+
         return None
-
-
+        
 def get_file_metadata_from_vector_store(client, vector_store_ids, file_id):
     """
     Fetch file metadata (attributes) from vector store.

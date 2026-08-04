@@ -7,11 +7,19 @@ from chatbot.models import CompanyChat, Profile, CompanyBot, ChatStatus, BotVern
 import json_repair
 
 from chatbot.utils.story_llama_utils import translate_field
-
+from langfuse import observe, get_client
+langfuse_context = get_client()
 
 @shared_task
+@observe() # Creates a Trace in langfuse
 def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
     print(session_id)
+    # Tag the trace with the session ID and user ID for the dashboard
+    langfuse_context.update_current_trace(
+        session_id=session_id,
+        user_id=profile_id,
+        tags=["mitra-create"]
+    )
     try:
         company_chats = CompanyChat.objects.filter(session=session_id).order_by('created_at')
         profile = Profile.objects.filter(id=profile_id).first()
@@ -42,6 +50,7 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
                 })
 
         tool_content = company_bot.tool_context
+        print(company_bot.llm_model)
         if tool_content and isinstance(tool_content, str):
             tool_content = json_repair.repair_json(tool_content, return_objects=True)
         try:
@@ -86,10 +95,25 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
 
             if response.get("should_move_forward") == 'yes':
                 message = ''
+                      # --- SCORE: did the conversation move forward this turn? ---
+                langfuse_context.score_current_trace(
+                name="should_move_forward",
+                value=1 if response.get("should_move_forward") == "yes" else 0,
+                data_type="BOOLEAN",
+                comment=f"validation={response.get('validation', '')}"
+                )
             elif response.get("validation") == 'NO_PROBLEM_STATEMENT':
                 message = end_context.get('NO_PROBLEM_STATEMENT', message)
             elif response.get("validation") == 'OUT_OF_SCOPE':
                 message = end_context.get('OUT_OF_SCOPE', message)
+            
+
+            validation_value = response.get("validation") or "OK"
+            langfuse_context.score_current_trace(
+                name="validation_result",
+                value=validation_value,
+                data_type="CATEGORICAL"
+            )
 
             translated_message = translate_and_send_message(
                 accumulated_message=message, current_channel_name=channel_name,
@@ -107,3 +131,9 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
     except Exception as e:
         print(e)
         traceback.print_exc()
+        langfuse_context.score_current_trace(
+            name="pipeline_error",
+            value=0,
+            data_type="BOOLEAN",
+            comment=str(e)[:200]
+        )

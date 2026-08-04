@@ -3,12 +3,21 @@ from celery import shared_task
 from chatbot.services.core.bot_service_factory import BotServiceFactory
 from chatbot.services.core.orchestrator import ChatOrchestrator
 import logging
+from langfuse import observe, get_client
+langfuse_context = get_client()
 
 logger = logging.getLogger('django')
 
 
 @shared_task
+@observe()
 def get_flow_response(channel_name, session_id, profile_id, route, bot_type, bot_route):
+    
+    langfuse_context.update_current_trace(
+        session_id=session_id,
+        user_id=profile_id,
+        tags=[bot_type, bot_route]
+    )
     """Common bot task"""
     print(f"bot_type is {bot_type} and bot_route is {bot_route}")
     bot_strategy = BotServiceFactory.create_bot_service(

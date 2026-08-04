@@ -25,3 +25,6 @@ CLAUDE.md
 memory.sh
 primer.md
 project-memory.md
+.refact
+.env.backend
+.env.postgress

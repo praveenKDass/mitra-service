@@ -1,12 +1,11 @@
-def load_env_to_dict(value: str | None) -> dict:
+def load_env_to_dict(value):
     if value is None:
         return {}
     env_dict = {}
-    env_lines = value.split("\n")
-    for line in env_lines:
+    for line in value.split("\n"):
         line = line.strip()
-        # Ignore empty lines and comments
-        if line and not line.startswith("#"):
-            key, value = line.split("=", 1)
-            env_dict[key.strip()] = value.strip().strip('"').strip("'")
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, val = line.split("=", 1)
+        env_dict[key.strip()] = val.strip().strip('"').strip("'")
     return env_dict

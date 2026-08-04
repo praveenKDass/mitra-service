@@ -158,3 +158,10 @@ django-redis
 ############################
 coreapi
 coreschema
+
+
+############################
+# langfuse / debugger
+############################
+
+langfuse
