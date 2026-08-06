@@ -14,6 +14,8 @@ import logging
 logger = logging.getLogger('django')
 channel_layer = get_channel_layer()
 
+from langfuse import get_client
+langfuse_context = get_client()
 
 class BaseResponseHandler(ABC):
     """Base class for handling LLM responses with common functionality"""
@@ -76,173 +78,7 @@ class BaseResponseHandler(ABC):
             }
         }
 
-    def handle_response(self, **kwargs):
-        """Main response handling method"""
-        session_id = kwargs['session_id']
-        chat_session = ChatSession.objects.get(session=session_id)
-        chunks = []
-        is_function_call = False
-        early_return = self.check_early_return(chat_session, **kwargs)
-        if early_return is not None:
-            if isinstance(early_return, str):
-                return early_return
-            elif isinstance(early_return, dict):
-                if early_return.get('skip_llm', False):
-                    kwargs['skip_llm'] = True
-                else:
-                    is_function_call = self.is_function_call(response=early_return)
-            else:
-                return early_return
-
-        company_bot = kwargs.get('company_bot')
-        try:
-            state_machine = CompanyStateMachine.objects.filter(
-                company_bot=company_bot, step=chat_session.current_step
-            ).first()
-        except Exception as e:
-            logger.error(f"Error getting state machine: {e}")
-            state_machine = None
-
-        if self.is_non_llm_state(state_machine):
-            from chatbot.models import CompanyChat
-
-            user_messages_for_state = CompanyChat.objects.filter(
-                session=session_id,
-                stage=state_machine.name
-            ).exclude(message=state_machine.bot_question).exists()
-
-            kwargs['skip_llm'] = True
-            kwargs['skip_reason'] = 'non_llm_operation_type'
-
-            if not user_messages_for_state:
-                kwargs['send_bot_question'] = True
-                kwargs['bot_question_from_db'] = state_machine.bot_question or None
-                logger.info(f"NON_LLM state {state_machine.name}: Asking question")
-
-            else:
-                kwargs['send_bot_question'] = False
-                kwargs['force_function_call'] = True
-                logger.info(f"NON_LLM state {state_machine.name}: Advancing to next state")
-
-        original_prompt = kwargs.get('system_prompt', [])
-
-        preprocessing_result = {'action': 'continue', 'prompt': original_prompt}
-        if state_machine and state_machine.preprocess_output_mode not in [
-            PreProcessOutputMode.NONE, PreProcessOutputMode.SKIP, PreProcessOutputMode.MODIFY_QUESTION
-        ]:
-            preprocessing_result = self.preprocessing_service.execute_preprocessing(
-                state_machine, original_prompt, **kwargs
-            )
-            if preprocessing_result['action'] == 'skip':
-                kwargs['skip_llm'] = True
-                kwargs['skip_reason'] = 'preprocessing'
-            elif preprocessing_result['action'] == 'modify_question':
-                kwargs['modified_bot_question'] = preprocessing_result.get('modified_bot_question')
-                kwargs['system_prompt'] = preprocessing_result.get('prompt', original_prompt)
-                logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
-            elif preprocessing_result['action'] == 'continue':
-                kwargs['system_prompt'] = preprocessing_result.get('prompt', original_prompt)
-
-        response = None
-        streaming_completed = False
-        if not is_function_call and not kwargs.get('skip_llm', False):
-            result = self.get_llm_response(**kwargs)
-
-            if isinstance(result, tuple):
-                response, extra_content, finish_reason = result
-                
-                # Store extra_content if present for later use
-                if extra_content:
-                    kwargs['llm_extra_content'] = extra_content
-            else:
-                response = result
-                finish_reason = None
-
-            use_streaming = self.should_use_streaming(company_bot)
-
-            streaming_completed = finish_reason == "stop" and use_streaming
-
-            # Only treat None as error
-            if response is None:
-                bot_vernacular = BotVernacular.objects.filter(
-                    company_bot=company_bot, language=kwargs['language']
-                ).first()
-                error_message = bot_vernacular.error_message if (
-                        bot_vernacular and bot_vernacular.error_message
-                ) else self.default_error_message
-                translated_message = self.translate_message(
-                    message=error_message, channel_name=kwargs['channel_name'],
-                    step_number=chat_session.current_step, language=kwargs['language'], company_bot=company_bot
-                )
-                self.save_message(
-                    session_id=session_id, profile_id=kwargs['profile_id'], message=error_message,
-                    chunks=chunks, status=ChatStatus.IN_PROGRESS, translated_message=translated_message,
-                    stage=state_machine.name if state_machine else None
-                )
-                return error_message
-
-        if is_function_call and response is None:
-            response = early_return
-        if kwargs.get('force_function_call') and state_machine:
-            is_function_call = True
-            response = self.build_non_llm_function_call(state_machine)
-
-        if not is_function_call:
-            is_function_call = self.is_function_call(response=response) if state_machine else False
-        if is_function_call and state_machine and response:
-            postprocessing_result = self.postprocessing_service.execute_postprocessing(
-                state_machine, response, **kwargs
-            )
-
-            if postprocessing_result.get('skip_next_stage', False):
-                kwargs['skip_next_stage'] = True
-                kwargs['target_stage'] = state_machine.skip_to_step
-                logger.info("Postprocessing will skip next stage")
-
-                next_stage_number = kwargs['target_stage']
-                try:
-                    next_state_machine = CompanyStateMachine.objects.get(
-                        company_bot=company_bot, step=next_stage_number
-                    )
-
-                    next_stage_preprocessing_result = self.preprocessing_service.execute_preprocessing(
-                        next_state_machine, kwargs.get('system_prompt', []), **kwargs
-                    )
-
-                    if next_stage_preprocessing_result['action'] == 'skip':
-                        kwargs['skip_next_stage_preprocessing'] = True
-                    elif next_stage_preprocessing_result['action'] == 'modify_question':
-                        kwargs['modified_bot_question'] = next_stage_preprocessing_result.get('modified_bot_question')
-                        kwargs['system_prompt'] = next_stage_preprocessing_result.get('prompt', original_prompt)
-                        logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
-
-                except CompanyStateMachine.DoesNotExist:
-                    logger.error(f"Next state machine {next_stage_number} not found for preprocessing")
-            else:
-                next_stage_number = chat_session.current_step + 1
-                try:
-                    next_state_machine = CompanyStateMachine.objects.get(
-                        company_bot=company_bot, step=next_stage_number
-                    )
-
-                    next_stage_preprocessing_result = self.preprocessing_service.execute_preprocessing(
-                        next_state_machine, kwargs.get('system_prompt', []), **kwargs
-                    )
-
-                    if next_stage_preprocessing_result['action'] == 'skip':
-                        kwargs['skip_next_stage_preprocessing'] = True
-                    elif next_stage_preprocessing_result['action'] == 'modify_question':
-                        kwargs['modified_bot_question'] = next_stage_preprocessing_result.get('modified_bot_question')
-                        kwargs['system_prompt'] = next_stage_preprocessing_result.get('prompt', original_prompt)
-                        logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
-
-                except CompanyStateMachine.DoesNotExist:
-                    logger.info(f"Next state machine {next_stage_number} not found, likely at end of flow")
-
-        return self.process_response(
-            response, chat_session, chunks, streaming_completed=streaming_completed, **kwargs
-        )
-
+   
     def analyze_response_for_postprocessing(self, response):
         """Analyze if response needs postprocessing - can be overridden by subclasses"""
         return self.is_function_call(response)
@@ -261,13 +97,211 @@ class BaseResponseHandler(ABC):
             logger.error(f"Error determining streaming mode: {e}")
             return False
 
+    def handle_response(self, **kwargs):
+        """Main response handling method"""
+        session_id = kwargs['session_id']
+        chat_session = ChatSession.objects.get(session=session_id)
+        chunks = []
+        is_function_call = False
+
+        with langfuse_context.start_as_current_observation(
+            as_type="span", name="check_early_return"
+        ) as span:
+            early_return = self.check_early_return(chat_session, **kwargs)
+            span.update(output={"early_return_type": type(early_return).__name__ if early_return is not None else None})
+
+        if early_return is not None:
+            if isinstance(early_return, str):
+                return early_return
+            elif isinstance(early_return, dict):
+                if early_return.get('skip_llm', False):
+                    kwargs['skip_llm'] = True
+                else:
+                    is_function_call = self.is_function_call(response=early_return)
+            else:
+                return early_return
+
+        company_bot = kwargs.get('company_bot')
+        with langfuse_context.start_as_current_observation(
+            as_type="span", name="lookup_state_machine",
+            input={"current_step": chat_session.current_step}
+        ) as span:
+            try:
+                state_machine = CompanyStateMachine.objects.filter(
+                    company_bot=company_bot, step=chat_session.current_step
+                ).first()
+            except Exception as e:
+                logger.error(f"Error getting state machine: {e}")
+                state_machine = None
+            span.update(output={"state_machine": state_machine.name if state_machine else None})
+
+        if self.is_non_llm_state(state_machine):
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="non_llm_state_handling"
+            ) as span:
+                from chatbot.models import CompanyChat
+
+                user_messages_for_state = CompanyChat.objects.filter(
+                    session=session_id,
+                    stage=state_machine.name
+                ).exclude(message=state_machine.bot_question).exists()
+
+                kwargs['skip_llm'] = True
+                kwargs['skip_reason'] = 'non_llm_operation_type'
+
+                if not user_messages_for_state:
+                    kwargs['send_bot_question'] = True
+                    kwargs['bot_question_from_db'] = state_machine.bot_question or None
+                    logger.info(f"NON_LLM state {state_machine.name}: Asking question")
+                else:
+                    kwargs['send_bot_question'] = False
+                    kwargs['force_function_call'] = True
+                    logger.info(f"NON_LLM state {state_machine.name}: Advancing to next state")
+
+                span.update(output={"branch": "ask_question" if not user_messages_for_state else "advance_state"})
+
+        original_prompt = kwargs.get('system_prompt', [])
+
+        preprocessing_result = {'action': 'continue', 'prompt': original_prompt}
+        if state_machine and state_machine.preprocess_output_mode not in [
+            PreProcessOutputMode.NONE, PreProcessOutputMode.SKIP, PreProcessOutputMode.MODIFY_QUESTION
+        ]:
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="preprocessing",
+                input={"preprocess_output_mode": str(state_machine.preprocess_output_mode)}
+            ) as span:
+                preprocessing_result = self.preprocessing_service.execute_preprocessing(
+                    state_machine, original_prompt, **kwargs
+                )
+                if preprocessing_result['action'] == 'skip':
+                    kwargs['skip_llm'] = True
+                    kwargs['skip_reason'] = 'preprocessing'
+                elif preprocessing_result['action'] == 'modify_question':
+                    kwargs['modified_bot_question'] = preprocessing_result.get('modified_bot_question')
+                    kwargs['system_prompt'] = preprocessing_result.get('prompt', original_prompt)
+                    logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
+                elif preprocessing_result['action'] == 'continue':
+                    kwargs['system_prompt'] = preprocessing_result.get('prompt', original_prompt)
+                span.update(output={"action": preprocessing_result['action']})
+
+        response = None
+        streaming_completed = False
+        if not is_function_call and not kwargs.get('skip_llm', False):
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="get_llm_response_call"
+            ) as span:
+                result = self.get_llm_response(**kwargs)
+
+                if isinstance(result, tuple):
+                    response, extra_content, finish_reason = result
+                    if extra_content:
+                        kwargs['llm_extra_content'] = extra_content
+                else:
+                    response = result
+                    finish_reason = None
+
+                span.update(output={"response_present": response is not None, "finish_reason": finish_reason})
+
+            use_streaming = self.should_use_streaming(company_bot)
+            streaming_completed = finish_reason == "stop" and use_streaming
+
+            if response is None:
+                with langfuse_context.start_as_current_observation(
+                    as_type="span", name="llm_error_fallback"
+                ) as span:
+                    bot_vernacular = BotVernacular.objects.filter(
+                        company_bot=company_bot, language=kwargs['language']
+                    ).first()
+                    error_message = bot_vernacular.error_message if (
+                            bot_vernacular and bot_vernacular.error_message
+                    ) else self.default_error_message
+                    translated_message = self.translate_message(
+                        message=error_message, channel_name=kwargs['channel_name'],
+                        step_number=chat_session.current_step, language=kwargs['language'], company_bot=company_bot
+                    )
+                    self.save_message(
+                        session_id=session_id, profile_id=kwargs['profile_id'], message=error_message,
+                        chunks=chunks, status=ChatStatus.IN_PROGRESS, translated_message=translated_message,
+                        stage=state_machine.name if state_machine else None
+                    )
+                    langfuse_context.score_current_trace(
+                        name="llm_response_error", value=0, data_type="BOOLEAN"
+                    )
+                return error_message
+
+        if is_function_call and response is None:
+            response = early_return
+        if kwargs.get('force_function_call') and state_machine:
+            is_function_call = True
+            response = self.build_non_llm_function_call(state_machine)
+
+        if not is_function_call:
+            is_function_call = self.is_function_call(response=response) if state_machine else False
+
+        if is_function_call and state_machine and response:
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="postprocessing"
+            ) as span:
+                postprocessing_result = self.postprocessing_service.execute_postprocessing(
+                    state_machine, response, **kwargs
+                )
+
+                if postprocessing_result.get('skip_next_stage', False):
+                    kwargs['skip_next_stage'] = True
+                    kwargs['target_stage'] = state_machine.skip_to_step
+                    logger.info("Postprocessing will skip next stage")
+
+                    next_stage_number = kwargs['target_stage']
+                    try:
+                        next_state_machine = CompanyStateMachine.objects.get(
+                            company_bot=company_bot, step=next_stage_number
+                        )
+                        next_stage_preprocessing_result = self.preprocessing_service.execute_preprocessing(
+                            next_state_machine, kwargs.get('system_prompt', []), **kwargs
+                        )
+                        if next_stage_preprocessing_result['action'] == 'skip':
+                            kwargs['skip_next_stage_preprocessing'] = True
+                        elif next_stage_preprocessing_result['action'] == 'modify_question':
+                            kwargs['modified_bot_question'] = next_stage_preprocessing_result.get('modified_bot_question')
+                            kwargs['system_prompt'] = next_stage_preprocessing_result.get('prompt', original_prompt)
+                            logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
+                    except CompanyStateMachine.DoesNotExist:
+                        logger.error(f"Next state machine {next_stage_number} not found for preprocessing")
+                else:
+                    next_stage_number = chat_session.current_step + 1
+                    try:
+                        next_state_machine = CompanyStateMachine.objects.get(
+                            company_bot=company_bot, step=next_stage_number
+                        )
+                        next_stage_preprocessing_result = self.preprocessing_service.execute_preprocessing(
+                            next_state_machine, kwargs.get('system_prompt', []), **kwargs
+                        )
+                        if next_stage_preprocessing_result['action'] == 'skip':
+                            kwargs['skip_next_stage_preprocessing'] = True
+                        elif next_stage_preprocessing_result['action'] == 'modify_question':
+                            kwargs['modified_bot_question'] = next_stage_preprocessing_result.get('modified_bot_question')
+                            kwargs['system_prompt'] = next_stage_preprocessing_result.get('prompt', original_prompt)
+                            logger.info(f"Preprocessing modified bot_question: {kwargs['modified_bot_question']}")
+                    except CompanyStateMachine.DoesNotExist:
+                        logger.info(f"Next state machine {next_stage_number} not found, likely at end of flow")
+
+                span.update(output={"skip_next_stage": postprocessing_result.get('skip_next_stage', False)})
+
+        with langfuse_context.start_as_current_observation(
+            as_type="span", name="process_response"
+        ) as span:
+            final = self.process_response(
+                response, chat_session, chunks, streaming_completed=streaming_completed, **kwargs
+            )
+            span.update(output={"final_present": final is not None})
+            return final
+
     def get_llm_response(self, **kwargs):
         """Get response from LLM provider"""
         company_bot = kwargs['company_bot']
         system_prompt = kwargs['system_prompt']
         response = None
         message_to_send = self.get_messages_for_llm(**kwargs)
-        print("message_to_send: ", message_to_send)
         session_id = kwargs['session_id']
         profile_id = kwargs.get('profile_id')
         channel_name = kwargs['channel_name']
@@ -287,7 +321,6 @@ class BaseResponseHandler(ABC):
                 and state_machine.tool_context
                 and state_machine.tool_context.strip()
         )
-
         has_company_bot_tool_context = (
                 company_bot
                 and hasattr(company_bot, 'tool_context')
@@ -303,7 +336,6 @@ class BaseResponseHandler(ABC):
                 if has_state_machine_tool_context
                 else company_bot.tool_context.strip()
             )
-
             try:
                 import json_repair
                 tools = json_repair.repair_json(tool_context, return_objects=True)
@@ -313,48 +345,56 @@ class BaseResponseHandler(ABC):
                 tools = None
 
         if company_bot.provider == LLMProvider.BEDROCK_CONVERSE:
-            try:
-                response = handle_bedrock_model(
-                    system_prompt=system_prompt,
-                    messages=message_to_send,
-                    model_name=company_bot.llm_model,
-                    temperature=company_bot.bot_temperature,
-                    max_token=company_bot.max_token,
-                    company_bot=company_bot,
-                    tools=tools
-                )
-            except Exception as e:
-                logger.error(f"Bedrock Error: %s", e)
-                response = None
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="bedrock_call_wrapper",
+                input={"model": company_bot.llm_model, "has_tools": tools is not None}
+            ) as span:
+                try:
+                    response = handle_bedrock_model(
+                        system_prompt=system_prompt,
+                        messages=message_to_send,
+                        model_name=company_bot.llm_model,
+                        temperature=company_bot.bot_temperature,
+                        max_token=company_bot.max_token,
+                        company_bot=company_bot,
+                        tools=tools
+                    )
+                    span.update(output={"response_present": response is not None})
+                except Exception as e:
+                    logger.error(f"Bedrock Error: %s", e)
+                    span.update(output={"error": str(e)})
+                    response = None
 
         elif company_bot.provider == LLMProvider.OPENAI:
             use_streaming = self.should_use_streaming(company_bot)
-
             logger.info(f"Using OpenAI {'streaming' if use_streaming else 'non-streaming'} for session {session_id}")
 
-            result = self._handle_openai_response(
-                system_prompt=system_prompt,
-                messages=message_to_send,
-                company_bot=company_bot,
-                channel_name=channel_name,
-                session_id=session_id,
-                profile_id=profile_id,
-                stream=use_streaming
-            )
+            with langfuse_context.start_as_current_observation(
+                as_type="span", name="openai_call_wrapper",
+                input={"streaming": use_streaming}
+            ) as span:
+                result = self._handle_openai_response(
+                    system_prompt=system_prompt,
+                    messages=message_to_send,
+                    company_bot=company_bot,
+                    channel_name=channel_name,
+                    session_id=session_id,
+                    profile_id=profile_id,
+                    stream=use_streaming
+                )
+                span.update(output={"result_present": result is not None})
 
             if result is None or (isinstance(result, tuple) and result[0] is None):
                 logger.error("OpenAI response returned None - error occurred")
                 response = None
             elif isinstance(result, tuple):
                 response, extra_content, finish_reason = result
-
                 if extra_content:
-                    print("Setting extra_content to ", extra_content)
                     kwargs['llm_extra_content'] = extra_content
-
                 return response, extra_content, finish_reason
             else:
                 response = result
+
         return response, None, None
 
     def _handle_openai_response(self, system_prompt, messages, company_bot,

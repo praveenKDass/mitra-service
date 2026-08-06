@@ -1,12 +1,11 @@
-# Shikshalokam Mohini Service – Local Setup
----
+## v# Shikshalokam Mohini Service – Local Setup
 
 ## Prerequisites
 
-* macOS
-* Homebrew installed
-* Python 3.10
-* Git
+- macOS
+- Homebrew installed
+- Python 3.10
+- Git
 
 ---
 
@@ -23,6 +22,7 @@ python3.10 --version
 ```
 
 Install uv:
+
 ```base
 pip install uv
 ```
@@ -173,7 +173,7 @@ python3 manage.py migrate
 
 (Optional) Create a superuser:
 
-You can accept the default name and give any password, keep email 
+You can accept the default name and give any password, keep email
 empty and just press enter till completed.
 
 ```bash
@@ -203,7 +203,6 @@ psql postgres
 lsof -i :5432
 ```
 
-
 ## 6. Run the Application Server
 
 ```bash
@@ -230,8 +229,8 @@ celery -A shikshalokam_mohini worker --pool=threads
 
 ## Notes
 
-* Ensure Redis or any other required backing services are running before starting Celery.
-* Always activate `mitra_env` before running server or worker commands.
+- Ensure Redis or any other required backing services are running before starting Celery.
+- Always activate `mitra_env` before running server or worker commands.
 
 ---
 
@@ -263,6 +262,7 @@ Start Redis as a background service:
 ```bash
 brew services start redis
 ```
+
 ---
 
 ### 8.3 Verify Redis Is Running

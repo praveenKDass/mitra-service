@@ -11,7 +11,7 @@ from langfuse import observe, get_client
 langfuse_context = get_client()
 
 @shared_task
-@observe() # Creates a Trace in langfuse
+@observe()  # Creates a Trace in langfuse
 def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
     print(session_id)
     # Tag the trace with the session ID and user ID for the dashboard
@@ -21,38 +21,47 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
         tags=["mitra-create"]
     )
     try:
-        company_chats = CompanyChat.objects.filter(session=session_id).order_by('created_at')
-        profile = Profile.objects.filter(id=profile_id).first()
-        ai_user = Profile.objects.get(id=1)
-        company_bot = CompanyBot.objects.get(route='/mitra-create')
-        system_context = company_bot.context
+        with langfuse_context.start_as_current_observation(as_type="span", name="load_chat_context") as span:
+            company_chats = CompanyChat.objects.filter(session=session_id).order_by('created_at')
+            profile = Profile.objects.filter(id=profile_id).first()
+            ai_user = Profile.objects.get(id=1)
+            company_bot = CompanyBot.objects.get(route='/mitra-create')
+            system_context = company_bot.context
+            span.update(output={
+                "chat_count": company_chats.count(),
+                "has_profile": profile is not None
+            })
 
-        prompt_to_use = [
-            {
-                'text': system_context.replace("{first_name}", profile.first_name if profile else "")
-            }
-        ]
+        with langfuse_context.start_as_current_observation(as_type="span", name="build_messages") as span:
+            prompt_to_use = [
+                {
+                    'text': system_context.replace("{first_name}", profile.first_name if profile else "")
+                }
+            ]
 
-        messages=[]
-        for chat in company_chats:
-            if chat.receiver == ai_user:
-                user_message = chat.message
-                if chat.translated_message is not None and chat.translated_message != '':
-                    user_message = chat.translated_message
-                messages.append({
-                    'role': 'user',
-                    'content': [{'text': user_message}]
-                })
-            else:
-                messages.append({
-                    'role': 'assistant',
-                    "content": [{'text': chat.message}]
-                })
+            messages = []
+            for chat in company_chats:
+                if chat.receiver == ai_user:
+                    user_message = chat.message
+                    if chat.translated_message is not None and chat.translated_message != '':
+                        user_message = chat.translated_message
+                    messages.append({
+                        'role': 'user',
+                        'content': [{'text': user_message}]
+                    })
+                else:
+                    messages.append({
+                        'role': 'assistant',
+                        "content": [{'text': chat.message}]
+                    })
+
+            span.update(output={"message_count": len(messages)})
 
         tool_content = company_bot.tool_context
         print(company_bot.llm_model)
         if tool_content and isinstance(tool_content, str):
             tool_content = json_repair.repair_json(tool_content, return_objects=True)
+
         try:
             response = handle_bedrock_model(
                 system_prompt=prompt_to_use, messages=messages, is_json_response=True,
@@ -60,7 +69,7 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
                 max_token=company_bot.max_token, company_bot=company_bot
             )
             message = response.get("message", "")
-            if message == '' and  response.get("should_move_forward") == 'no':
+            if message == '' and response.get("should_move_forward") == 'no':
                 raise
         except Exception:
             bot_vernacular = BotVernacular.objects.filter(company_bot=company_bot, language=route).first()
@@ -80,10 +89,15 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
                 voice_provider = Voice.objects.filter(
                     company_bot=company_bot, type=VoiceType.TextToText, language=route
                 ).first()
-                problem_statement = translate_field(
-                    voice_provider=voice_provider, message_body=problem_statement, target_language=route,
-                    source_language='en'
-                )
+                with langfuse_context.start_as_current_observation(
+                    as_type="span", name="translate_problem_statement",
+                    input={"target_language": route}
+                ) as span:
+                    problem_statement = translate_field(
+                        voice_provider=voice_provider, message_body=problem_statement, target_language=route,
+                        source_language='en'
+                    )
+                    span.update(output={"translated_len": len(problem_statement or "")})
 
             extra_content = {
                 "problem_statement": problem_statement,
@@ -95,18 +109,17 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
 
             if response.get("should_move_forward") == 'yes':
                 message = ''
-                      # --- SCORE: did the conversation move forward this turn? ---
+                # --- SCORE: did the conversation move forward this turn? ---
                 langfuse_context.score_current_trace(
-                name="should_move_forward",
-                value=1 if response.get("should_move_forward") == "yes" else 0,
-                data_type="BOOLEAN",
-                comment=f"validation={response.get('validation', '')}"
+                    name="should_move_forward",
+                    value=1 if response.get("should_move_forward") == "yes" else 0,
+                    data_type="BOOLEAN",
+                    comment=f"validation={response.get('validation', '')}"
                 )
             elif response.get("validation") == 'NO_PROBLEM_STATEMENT':
                 message = end_context.get('NO_PROBLEM_STATEMENT', message)
             elif response.get("validation") == 'OUT_OF_SCOPE':
                 message = end_context.get('OUT_OF_SCOPE', message)
-            
 
             validation_value = response.get("validation") or "OK"
             langfuse_context.score_current_trace(
@@ -115,18 +128,21 @@ def get_mitra_bedrock_response(channel_name, session_id, profile_id, route):
                 data_type="CATEGORICAL"
             )
 
-            translated_message = translate_and_send_message(
-                accumulated_message=message, current_channel_name=channel_name,
-                current_step_number=1, finish_reason="stop", route=route,
-                extra_content=extra_content, company_bot=company_bot
-            )
-            if not message or not str(message).strip():
-                message = "Understood."
+            with langfuse_context.start_as_current_observation(as_type="span", name="send_and_persist") as span:
+                translated_message = translate_and_send_message(
+                    accumulated_message=message, current_channel_name=channel_name,
+                    current_step_number=1, finish_reason="stop", route=route,
+                    extra_content=extra_content, company_bot=company_bot
+                )
+                if not message or not str(message).strip():
+                    message = "Understood."
 
-            save_in_company_db(
-                session_id, profile_id, 'AI', message, None, ChatStatus.IN_PROGRESS,
-                translated_message
-            )
+                save_in_company_db(
+                    session_id, profile_id, 'AI', message, None, ChatStatus.IN_PROGRESS,
+                    translated_message
+                )
+                span.update(output={"message_sent": bool(translated_message)})
+
         return response
     except Exception as e:
         print(e)
